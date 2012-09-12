@@ -1,0 +1,620 @@
+//==============================================================================
+//              Cooperative MultiTasking system
+//                    CMT system
+// By Alexander Sibilev
+//==============================================================================
+#define END_CLUSTER 0xffffffff
+
+struct CmtFatFinder {
+  uint32 subDirStart;
+  uint32 rootCount;
+  uint32 sector;
+  uint32 recCount;
+
+  CmtFatFinder( uint32 subDir ) :
+    subDirStart( subDir ),
+    rootCount(0),
+    sector(0),
+    recCount(0) {}
+
+  void Set( uint32 subDir ) {
+    subDirStart = subDir;
+    rootCount = 0;
+    sector = 0;
+    recCount = 0;
+    }
+  };
+
+
+struct CmtFat : public CmtFileSystemBase {
+  //Часть для FAT
+  uint32          ptLBAStart;       //Номер начального сектора раздела в режиме LBA
+  uint32          ptLBASize;        //Количество секторов в разделе (0-если диска нет, иначе диск есть)
+  uint32          clusterPerPart;   //Количество кластеров в разделе
+  uint32          sectorPerCluster; //Секторов на кластер
+  uint32          fatNumber;        //Количество FAT
+  uint32          fatSize;          //Размер FAT в секторах
+  uint32          firstRoot;        //Первый сектор корневого директория FAT12,16; Первый кластер корневого директория FAT32
+  uint32          firstData;        //Первый сектор данных
+  uint32          curFreeCluster;   //Начальный кластер поиска свободных кластеров
+  uint8           dirSector[512];
+  uint8           fatSector[512];
+  uint_8          dirtyDirSector;
+  uint32          curDirSector;
+  uint_8          dirtyFatSector;
+  uint32          curFatSector;
+
+  CmtFat( CmtBlockDevice *disk, uint32 _fatSize, uint32 lbaSize, uint32 spc, uint32 fatNum, uint32 lbaStart, uint32 numClus ) :
+    CmtFileSystemBase( disk ),
+    ptLBAStart( lbaStart ),
+    ptLBASize( lbaSize ),
+    clusterPerPart( numClus ),
+    sectorPerCluster(spc),
+    fatNumber( fatNum ),
+    fatSize( _fatSize ),
+    firstRoot(0),
+    firstData(0),
+    //numRootElem( numRoot ),
+    curFreeCluster(2),
+    dirtyDirSector(0),
+    curDirSector(0xffffffff),
+    dirtyFatSector(0),
+    curFatSector(0xffffffff) {
+      CADDREF(mDisk);
+      }
+    
+    ~CmtFat() {
+      CDECREF(mDisk);
+      }
+
+          void           FlushFat();
+          void           FlushDir();
+          void           NeedDirSector( uint32 sector );
+          uint32         SectorFromCluster( uint32 cluster ) { return firstData + (cluster - 2) * sectorPerCluster; }
+          FatDirEntry1x* GetDirRecord( uint32 sector, uint32 number );
+          void           FreeClusters( uint32 startCluster );
+          void           DeleteFileEntryEx( FatDirEntry1x *ptr, uint32 startCluster );
+          FatDirEntry1x* FindFileEntry( uint32 subDirStart, cpchar pattern, cpchar tail );
+          cpchar         GetSubDir( cpchar pattern, uint32 *subDirStart );
+          FatDirEntry1x* FindFile( cpchar pattern );
+          FatDirEntry1x* CreateFileName( cpchar pattern );
+          void           InitDirCluster( uint32 cluster );
+
+  virtual int32          GetFileAttr( cpchar fname, CMT_FILE_ATTR *attr );
+  virtual int32          SetFileAttr( cpchar fname, CMT_FILE_ATTR *attr );
+  virtual uint32         GetCluster( uint32 cluster ) = 0;
+  virtual void           SetCluster( uint32 cluster, uint32 value ) = 0;
+  virtual uint32         GetFreeCluster();
+  virtual void           DeleteFileEntry( FatDirEntry1x *ptr );
+  virtual FatDirEntry1x* GetNextFileEntry( CmtFatFinder *lpFinder ) = 0;
+  virtual int32          IncreaseDir( uint32 startDir );
+
+  virtual CmtFinderBase* FindFirst( cpchar pattern, int32 findFlag, CMT_FILE_ATTR *attr );
+  virtual CmtFileBase*   FileCreate( cpchar fname, int32 msMode );
+  virtual int32          CreateDirectory( cpchar dirName );
+  virtual int32          FileRename( cpchar sour, cpchar dest );
+  virtual int32          FileDelete( cpchar fname );
+  };
+
+struct CmtFatFile : public CmtFileBase {
+  CmtFat        *mFat;
+  uint32         msMode;
+  uint32         mFileSize;      //Размер файла
+  uint32         mDirSector;     //Сектор директория
+  uint32         mDirOffset;     //Смещение в секторе директория позиции директория
+  uint32         mFilePosition;  //Текущая позиция указателя файла
+  uint32         mFileCluster;   //Текущий номер кластера файла
+  uint32         mFirstCluster;  //Номер первого кластера файла
+  uint32         mFileSector;    //Номер сектора в кластере
+  uint32         mFileOffset;    //Смещение указателя внутри буфера сектора (кэша)
+  uint8          buffer[512];    //Буфер сектора
+
+  public:
+
+  CmtFatFile( CmtFat *fs, FatDirEntry1x *ptr, uint32 mode );
+  ~CmtFatFile();
+
+  virtual uint32 Read( pvoid buffer, uint32 size );
+  virtual uint32 Write( cpvoid buffer, uint32 size );
+  virtual uint32 Seek( int32 pos, uint32 from );
+  virtual uint32 Flush();
+  virtual uint32 Position() { return mFilePosition; }
+  virtual uint32 Size() { return mFileSize; }
+  virtual void   Clear();
+  virtual char   Peek();
+  virtual int32  State();
+
+  private:
+          uint32 ReadFileSectorInc();
+          uint32 WriteFileSectorInc();
+          uint32 CheckWriteSector();
+  };
+
+//==============================================================================
+//--------------------- FAT - поисковик файлов ---------------------------------
+struct CmtFatFileFinder : public CmtFinderBase {
+  CmtFatFinder  mFinder;
+  CmtFat       *mFat;
+  cpchar        mPattern;
+  uint8         mFinderFlag;
+
+  CmtFatFileFinder( CmtFat *fat, cpchar pat, CmtFatFinder *finder, uint8 flag );
+  ~CmtFatFileFinder();
+
+  virtual uint_8 FindNext( CMT_FILE_ATTR *attr );
+  };
+
+CmtFatFileFinder::CmtFatFileFinder( CmtFat *fat, cpchar pat, CmtFatFinder *finder, uint8 flag ) :
+  mFinder(0),
+  mFat(fat),
+  mPattern(pat),
+  mFinderFlag(flag)
+    {
+    //Копировать поисковик
+    memcpy( &mFinder, finder, sizeof(CmtFatFinder) );
+    //Резервировать FAT
+    CADDREF(mFat);
+    }
+
+CmtFatFileFinder::~CmtFatFileFinder() {
+  CDECREF(mFat);
+  }
+
+uint_8
+CmtFatFileFinder::FindNext( CMT_FILE_ATTR *lpFileAttr ) {
+  FatDirEntry1x *ptr;
+  int32 res = CMTE_FAIL;
+  //if( mFat == 0 ) return 0;
+  char longName[CMT_MAX_PATH];
+  longName[0] = 0;
+  CLOCK(mFat);
+  while(1) {
+    ptr = mFat->GetNextFileEntry( &mFinder );
+    if( ptr == 0 ) break; //Ничего не найдено
+    if( ptr->CheckLongName( longName ) ) continue;
+    //Найден очередной элемент директория
+    if( ptr->PatternName( longName, mPattern, mFinderFlag ) ) {
+      //Подходит
+      ptr->FillAttr( longName, lpFileAttr );
+      res = CMTE_OK;
+      break;
+      }
+    longName[0] = 0;
+    }
+  CUNLOCK(mFat);
+  return res;
+  }
+
+//==============================================================================
+//--------------------- FAT - общая --------------------------------------------
+int32
+CmtFat::IncreaseDir( uint32 startDir ) {
+  //Распределить новый кластер
+  uint32 cluster = GetFreeCluster();
+  if( cluster == 0 || cluster == END_CLUSTER ) return CMTE_FS_DISK_FULL;
+  //Получить последний кластер
+  uint32 last;
+  while( startDir != 0 && startDir != END_CLUSTER ) {
+    last = startDir;
+    startDir = GetCluster( startDir );
+    }
+  //Установить цепочку
+  SetCluster( last, cluster );
+  SetCluster( cluster, END_CLUSTER );
+  //Подготовить кластер директория
+  InitDirCluster( cluster );
+  return CMTE_OK;
+  }
+
+
+void
+CmtFat::FlushFat() {
+  if( dirtyFatSector ) {
+    //Сохранить сектор FAT
+    mDisk->Write( (uint32*)fatSector, curFatSector + ptLBAStart, 1 );
+    //Проверить наличие второй таблицы FAT
+    if( fatNumber > 1 )
+      mDisk->Write( (uint32*)fatSector, curFatSector + ptLBAStart + fatSize, 1 );
+    dirtyFatSector = 0;
+    }
+  }
+
+void
+CmtFat::FlushDir() {
+  if( dirtyDirSector ) {
+    //Требуется сохранение сектора
+    mDisk->Write( (uint32*)dirSector, curDirSector, 1 );
+    dirtyDirSector = 0;
+    }
+  }
+
+void
+CmtFat::NeedDirSector( uint32 sector ) {
+  //Вычислить номер сектора
+  if( sector != curDirSector ) {
+    //Требуется загрузка нового сектора
+    FlushDir();
+    //Прочитать новый сектор
+    if( mDisk->Read( (uint32*)dirSector, sector, 1 ) != CMTE_OK ) {
+      memset( dirSector, 0, 512 );
+      }
+    curDirSector = sector;
+    }
+  }
+
+FatDirEntry1x*
+CmtFat::GetDirRecord( uint32 sector, uint32 number ) {
+  NeedDirSector( sector );
+  return (FatDirEntry1x*)(dirSector + ((number & 0xf) << 5));
+  }
+
+int32
+CmtFat::GetFileAttr( cpchar fname, CMT_FILE_ATTR *attr ) {
+  devLock();
+  FatDirEntry1x *ptr = FindFile( fname );
+  if( ptr ) {
+    //Файл найден
+    ptr->FillAttr( fname, attr );
+    devUnLock();
+    return CMTE_OK;
+    }
+  devUnLock();
+  return CMTE_FS_NO_FILE;
+  }
+
+int32
+CmtFat::SetFileAttr( cpchar fname, CMT_FILE_ATTR *lpFileAttr ) {
+  devLock();
+  FatDirEntry1x *ptr = FindFile( fname );
+  if( ptr ) {
+    //Файл найден
+    ptr->mAttrib = lpFileAttr->fileAttributes;
+    dirtyDirSector = 1;
+    devUnLock();
+    return CMTE_OK;
+    }
+  devUnLock();
+  return CMTE_FS_NO_FILE;
+  }
+
+uint32
+CmtFat::GetFreeCluster() {
+  //Выполнять поиск свободного кластера пока не кончится диск
+  while( curFreeCluster < clusterPerPart ) {
+    //Проверить текущий кластер
+    if( GetCluster( curFreeCluster ) == 0 )
+      return curFreeCluster; //Возврат если он свободен
+    //Иначе переходим к следующему кластеру
+    curFreeCluster++;
+    }
+  return 0;
+  }
+
+void
+CmtFat::FreeClusters( uint32 cluster ) {
+  if( cluster == 0 || cluster == END_CLUSTER ) return;
+  if( cluster < curFreeCluster )
+    curFreeCluster = cluster;
+  while( cluster != END_CLUSTER ) {
+    uint32 next = GetCluster( cluster );
+    SetCluster( cluster, 0 );
+    if( curFreeCluster > cluster )
+      curFreeCluster = cluster;
+    cluster = next;
+    }
+  }
+
+void
+CmtFat::DeleteFileEntryEx( FatDirEntry1x *ptr, uint32 cluster ) {
+  //Удалить цепочку кластеров
+  FreeClusters( cluster );
+  //Поставить флаг удаленного
+  ptr->mFileName[0] = 0xe5;
+  dirtyDirSector = 1;
+  }
+
+void
+CmtFat::DeleteFileEntry( FatDirEntry1x *ptr ) {
+  DeleteFileEntryEx( ptr, ptr->GetFirstCluster32() );
+  }
+
+
+//Ищет в текущем поддиректории запись о файле
+FatDirEntry1x*
+CmtFat::FindFileEntry( uint32 subDirStart, cpchar pattern, cpchar tail ) {
+  CmtFatFinder finder( subDirStart );
+  //Место для длинного имени
+  char longName[CMT_MAX_PATH];
+  longName[0] = 0;
+  while(1) {
+    FatDirEntry1x *ptr = GetNextFileEntry( &finder );
+    if( ptr == 0 ) return 0; //Совпадений не обнаружено
+    if( ptr->CheckLongName( longName ) ) continue;
+    //Сравнить запись с заданным именем
+    if( ptr->MatchName( longName, pattern, tail ) )
+      return ptr;  //Равенство обнаружено, завершить
+    longName[0] = 0;
+    }
+  }
+
+
+//Получить начальный кластер для директория
+cpchar
+CmtFat::GetSubDir( cpchar pattern, uint32 *subDirStart ) {
+  FatDirEntry1x *ptr;
+  *subDirStart = 0; //Начнем с корневого директория
+  while(1) {
+    //Выделить очередной путь
+    cpchar tail = pattern; //Инициализация хвоста
+    while( *tail && *tail != '\\' && *tail != '/' ) tail++; //Получить позицию хвоста
+    if( tail == pattern ) return 0; //Неудачная попытка - пустой директорий
+    if( *tail == 0 ) {
+      return pattern; //Остался один файл - поиск закончен
+      }
+    //Будем искать поддиректорий в текущем директории
+    ptr = FindFileEntry( *subDirStart, pattern, tail );
+    if( ptr == 0 ) return 0; //Неудачная попытка - путь не найден
+    *subDirStart = ptr->GetFirstCluster32(); //Сохранить начало текущего поддиректория
+    pattern = tail + 1;
+    }
+  }
+
+FatDirEntry1x*
+CmtFat::FindFile( cpchar pattern ) {
+  uint32 subDir = 0;
+  //Войти в поддиректорий
+  pattern = GetSubDir( pattern, &subDir );
+  if( pattern ) {
+    //Успешно вошли в поддиректорий
+    return FindFileEntry( subDir, pattern, pattern + strlen(pattern) );
+    }
+  return 0; //Нет файла
+  }
+
+
+CmtFinderBase*
+CmtFat::FindFirst( cpchar pattern, int32 findFlag, CMT_FILE_ATTR *lpFileAttr ) {
+  CmtFinderBase *finderBase = 0;
+  uint32 subDir = 0; //Начальный кластер поддиректория
+  devLock();
+  //Войти в поддиректорий
+  cpchar pat = GetSubDir( pattern, &subDir );
+  if( pat ) {
+    //Успешно вошли в поддиректорий
+    FatDirEntry1x *ptr;
+    CmtFatFinder finder( subDir );
+    //Место для длинного имени
+    char longName[CMT_MAX_PATH];
+    longName[0] = 0;
+    while(1) {
+      ptr = GetNextFileEntry( &finder );
+      if( ptr == 0 ) break; //Ничего не найдено
+      if( ptr->CheckLongName( longName ) ) continue;
+      //Найден очередной элемент директория
+      if( ptr->PatternName( longName, pat, (uint8)findFlag ) ) {
+        if( lpFileAttr ) {
+          ptr->FillAttr( longName, lpFileAttr );
+          //Создать поисковик
+          finderBase = new CmtFatFileFinder( this, pat, &finder, (uint8)findFlag );
+          }
+        else {
+          //Требуется только определить наличие
+          finderBase = (CmtFinderBase*)1;
+          }
+        break;
+        }
+      longName[0] = 0;
+      }
+    }
+  devUnLock();
+  return finderBase; //Нет директория
+  }
+
+FatDirEntry1x*
+CmtFat::CreateFileName( cpchar pattern ) {
+  uint32 subDir = 0;
+  //Войти в поддиректорий
+  pattern = GetSubDir( pattern, &subDir );
+  if( pattern ) {
+    //Успешно вошли в поддиректорий
+    CmtFatFinder finder( subDir );
+    while(1) {
+      FatDirEntry1x *ptr = GetNextFileEntry( &finder );
+      if( ptr == 0 ) {
+        //Пустых записей не обнаружено, попробовать увеличить директорий
+        if( IncreaseDir( subDir ) != CMTE_OK )
+          return 0;
+        else {
+          //Директорий увеличен, повторить попытку поиска
+          finder.Set( subDir );
+          continue;
+          }
+        }
+      //Проверить, что запись пустая
+      if( ptr->mFileName[0] == 0 || ptr->mFileName[0] == 0xe5 ) {
+        //Запись пустая, заполнить имя
+        int c;
+        for( c = 0; c < 8 && *pattern != '.' && *pattern; c++ ) {
+          ptr->mFileName[c] = cmtCharUpper( *pattern++ );
+          }
+        //Добить оставшуюся часть имени пробелами
+        while( c < 8 ) ptr->mFileName[c++] = ' ';
+        //Добраться до точки
+        while( *pattern && *pattern != '.' ) pattern++;
+        if( *pattern == '.' ) pattern++;
+        for( c = 0; c < 3 && *pattern; c++ ) {
+          ptr->mExtension[c] = cmtCharUpper( *pattern++ );
+          }
+        //Добить оставшуюся часть имени пробелами
+        while( c < 3 ) ptr->mExtension[c++] = ' ';
+        CmtSystemTime ft;
+        ft.GetSystem();
+        //Заполнить остальные поля
+        ptr->mAttrib = FA_ARHIV;
+        ptr->mReserved[0] = ptr->mReserved[1] = 0;
+        ptr->mUpdateTime =     //time create/update
+        ptr->mCreationTime = ft.FFTime();
+        ptr->mUpdateDate =     //date create/update
+        ptr->mAccessDate =
+        ptr->mCreationDate = ft.FFDate();
+        ptr->mFirstClusterHigh = 0; // higher
+        ptr->mFileSize = 0;
+        ptr->SetFirstCluster32( GetFreeCluster() );
+        if( ptr->GetFirstCluster32() > 0 )
+          SetCluster( ptr->GetFirstCluster32(), END_CLUSTER );
+        dirtyDirSector = 1;
+        return ptr;
+        }
+      }
+    }
+  return 0; //Нет файла
+  }
+
+CmtFileBase*
+CmtFat::FileCreate( cpchar fname, int32 msMode ) {
+  FatDirEntry1x *ptr = 0;
+  CmtFileBase *file = 0;
+  devLock();
+  if( msMode & CMT_CREATE_WRITE ) {
+    //Открыть для записи
+    ptr = FindFile( fname );
+    //Если уже существует, то удалить файл
+    if( ptr && (msMode & CMT_FILE_RESET) ) {
+      DeleteFileEntry( ptr );
+      ptr = 0;
+      }
+    //Создать новый файл
+    if( ptr == 0 )
+      ptr = CreateFileName( fname );
+    }
+  else if( msMode & CMT_CREATE_READ ) {
+    //Открыть для чтения
+    ptr = FindFile( fname );
+    }
+  if( ptr ) {
+    //Файл найден
+    file = new CmtFatFile( this, ptr, msMode );
+    }
+  devUnLock();
+  return file;
+  }
+
+int32
+CmtFat::FileDelete( cpchar fname ) {
+  devLock();
+  FatDirEntry1x *ptr = FindFile( fname );
+  //Если уже существует, то удалить файл
+  if( ptr ) {
+    DeleteFileEntry( ptr );
+    devUnLock();
+    return CMTE_OK;
+    }
+  devUnLock();
+  return CMTE_FS_NO_FILE;
+  }
+
+int32
+CmtFat::CreateDirectory( cpchar dirName ) {
+  FatDirEntry1x *ptr = 0;
+  devLock();
+  //Открыть для записи
+  ptr = FindFile( dirName );
+  //Если уже существует, то невозможно создать
+  if( ptr ) {
+    devUnLock();
+    return CMTE_FS_DIR_PRESENT;
+    }
+  uint32 subDir = 0; //Обозначение кластера директория верхнего уровня
+  GetSubDir( dirName, &subDir );
+  ptr = CreateFileName( dirName );
+  if( ptr ) {
+    //Обозначить как директорий
+    ptr->mAttrib = FA_DIRECTORY;
+    uint16 time = ptr->mCreationTime;
+    uint16 date = ptr->mCreationDate;
+    uint32 cluster = ptr->GetFirstCluster32();
+
+    //Инициализировать кластер
+    InitDirCluster( cluster );
+
+    //Сформировать пустой директорий
+
+    //Заполнить начальные записи директория
+    ptr = GetDirRecord( SectorFromCluster(cluster), 0 );
+    memcpy( ptr->mFileName, ".          ", 11 );
+    ptr->mAttrib = FA_DIRECTORY;
+    ptr->mReserved[0] = ptr->mReserved[1] = 0;
+    ptr->mUpdateTime =     //time create/update
+    ptr->mCreationTime = time;
+    ptr->mUpdateDate =     //date create/update
+    ptr->mAccessDate =
+    ptr->mCreationDate = date;
+    ptr->mFirstClusterHigh = 0; // higher
+    ptr->mFileSize = 0;
+    ptr->SetFirstCluster32( cluster );
+
+    //Объявить сектор грязным
+    dirtyDirSector = 1;
+
+    ptr = GetDirRecord( curDirSector, 1 );
+    memcpy( ptr->mFileName, "..         ", 11 );
+    ptr->mAttrib = FA_DIRECTORY;
+    ptr->mReserved[0] = ptr->mReserved[1] = 0;
+    ptr->mUpdateTime =     //time create/update
+    ptr->mCreationTime = time;
+    ptr->mUpdateDate =     //date create/update
+    ptr->mAccessDate =
+    ptr->mCreationDate = date;
+    ptr->mFirstClusterHigh = 0; // higher
+    ptr->mFileSize = 0;
+    ptr->SetFirstCluster32( subDir );
+
+    //Объявить сектор грязным
+    dirtyDirSector = 1;
+
+    devUnLock();
+    return CMTE_OK;
+    }
+  devUnLock();
+  return CMTE_FAIL;
+  }
+
+void
+CmtFat::InitDirCluster( uint32 cluster ) {
+  //Освободить сектор директория
+  FlushDir();
+
+  //Первый сектор директория
+  memset( dirSector, 0, 512 );
+
+  //Установить номер сектора
+  curDirSector = SectorFromCluster(cluster) + sectorPerCluster;
+
+  //Записать все сектора кластера (кроме первого)
+  for( uint32 i = 0; i < sectorPerCluster; i++ ) {
+    //Объявить сектор грязным
+    dirtyDirSector = 1;
+    //Перейти к очередному сектору
+    curDirSector--;
+    //Записать на диск
+    FlushDir();
+    }
+  }
+
+
+int32
+CmtFat::FileRename( cpchar sour, cpchar dest ) {
+  FatDirEntry1x *ptr;
+  devLock();
+  //Открыть для записи
+  ptr = FindFile( sour );
+  //Если уже существует, то переименовать
+  //if( ptr ) {
+    //FatDirEntry1x temp;
+    //memcpy( &temp, ptr, sizeof(F))
+    //}
+  devUnLock();
+  return CMTE_OK;
+  }
+
+
